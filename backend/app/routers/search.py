@@ -1,11 +1,14 @@
-"""数据检索接口：维护检索索引，覆盖提交构建、启用索引、标记失效等动作。"""
+"""数据检索接口：维护检索索引，覆盖提交构建、启用索引、标记失效等动作。
+
+列表与导出共用 ``SearchService.query_entries``，保证两个入口的筛选、排序和分页口径一致。
+"""
 from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Request
 
-from app.schemas import ActionResult, EntryPayload, PageResult
+from app.schemas import ActionResult, EntryPayload, SearchPageResult
 from app.services.search import SearchService
 
 router = APIRouter(prefix="/api/search", tags=["数据检索"])
@@ -15,19 +18,121 @@ service = SearchService()
 LIST_FIELDS = ["索引编号", "索引名称", "覆盖表名", "索引字段", "分词策略", "排序权重", "刷新频率", "索引大小"]
 STATUSES = ["草稿", "待构建", "已生效", "已失效"]
 
+# 查询参数别名：中文列名、常见英文列名都映射到统一的过滤字段。
+FILTER_ALIASES = {
+    "索引编号": "索引编号",
+    "code": "索引编号",
+    "index_code": "索引编号",
+    "indexCode": "索引编号",
+    "索引名称": "索引名称",
+    "name": "索引名称",
+    "index_name": "索引名称",
+    "indexName": "索引名称",
+    "覆盖表名": "覆盖表名",
+    "table": "覆盖表名",
+    "table_name": "覆盖表名",
+    "tableName": "覆盖表名",
+    "covered_table": "覆盖表名",
+    "索引字段": "索引字段",
+    "fields": "索引字段",
+    "index_field": "索引字段",
+    "indexField": "索引字段",
+}
+STATUS_ALIASES = {"status": "status", "状态": "status", "索引状态": "status"}
+# 分页与协议参数不参与过滤。
+META_KEYS = {"page", "size", "keyword", "field", "value", "format"}
 
-@router.get("", response_model=PageResult[dict])
-def list_entries(
-    keyword: str | None = Query(default=None, description="按索引编号检索"),
-    status: str | None = Query(default=None, description="草稿、待构建、已生效、已失效"),
-    page: int = 1,
-    size: int = 20,
-) -> PageResult[dict]:
-    """按索引编号与状态过滤数据检索列表；没有数据时返回空页，不报错。"""
+
+def _clean(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _collect_filters(request: Request) -> tuple[dict[str, str], list[str], str | None, str | None, str | None]:
+    """把请求里的查询参数统一成 (过滤条件, 非法字段, field, value, status)。
+
+    空白值视为未过滤；无法识别的字段名记为非法，避免它被忽略后显示成全部命中。
+    """
+    filters: dict[str, str] = {}
+    invalid: list[str] = []
+    explicit_field: str | None = None
+    explicit_value: str | None = None
+    status: str | None = None
+
+    for raw_name, raw_value in request.query_params.multi_items():
+        name = raw_name.strip()
+        value = _clean(raw_value)
+        if not value:
+            # 空白筛选值以未过滤为准。
+            continue
+        if name in META_KEYS:
+            if name == "field":
+                explicit_field = value
+            elif name == "value":
+                explicit_value = value
+            continue
+        if name in STATUS_ALIASES:
+            status = value
+            continue
+        canonical = FILTER_ALIASES.get(name)
+        if canonical is None:
+            invalid.append(name)
+            continue
+        filters[canonical] = value
+
+    return filters, invalid, explicit_field, explicit_value, status
+
+
+def _query(request: Request, *, page: int = 1, size: int | None = 20) -> dict[str, Any]:
+    filters, invalid, field, value, status = _collect_filters(request)
+    keyword = _clean(request.query_params.get("keyword")) or None
+    return service.query_entries(
+        keyword=keyword,
+        status=status,
+        filters=filters,
+        field=field,
+        value=value,
+        page=page,
+        size=size,
+        invalid_fields=invalid,
+    )
+
+
+@router.get("/export")
+def export_entries(request: Request) -> dict[str, Any]:
+    """导出数据检索清单：沿用列表当前的筛选条件，并显式带上索引状态。
+
+    空白筛选值表示不过滤；非法筛选字段返回空结果并在 message 中说明。
+    """
+    result = _query(request, page=1, size=None)
+    items = []
+    for row in result["items"]:
+        exported = dict(row)
+        exported["索引状态"] = row.get("status")
+        items.append(exported)
+    return {
+        "module": "search",
+        "total": result["total"],
+        "items": items,
+        "filters": result["filters"],
+        "status": result["filters"].get("status"),
+        "message": result["message"],
+    }
+
+
+@router.get("", response_model=SearchPageResult)
+def list_entries(request: Request, page: int = 1, size: int = 20) -> SearchPageResult:
+    """按编号、名称、覆盖表名、索引字段与状态过滤；条件之间为“且”，空白值不生效。"""
     if size > 200:
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
-    items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
-    return PageResult(items=items, total=total, page=page, size=size)
+    result = _query(request, page=page, size=size)
+    return SearchPageResult(
+        items=result["items"],
+        total=result["total"],
+        page=result["page"],
+        size=result["size"],
+        message=result["message"],
+        filters=result["filters"],
+    )
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +161,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出数据检索清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "search", "total": total, "items": items}

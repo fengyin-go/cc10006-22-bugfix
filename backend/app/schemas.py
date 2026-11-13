@@ -15,6 +15,18 @@ class PageResult(BaseModel, Generic[T]):
     size: int = 20
 
 
+class SearchPageResult(BaseModel):
+    """数据检索列表结果：额外带回生效的过滤条件与未命中说明。"""
+
+    items: list[dict[str, Any]]
+    total: int
+    page: int = 1
+    size: int = 20
+    # 空结果时说明未命中的条件，非法筛选字段单独提示。
+    message: str | None = None
+    filters: dict[str, str] = Field(default_factory=dict)
+
+
 class ActionResult(BaseModel):
     ok: bool
     message: str
